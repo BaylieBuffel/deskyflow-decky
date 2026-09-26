@@ -187,6 +187,23 @@ def _describe_launcher(role: str):
     return {"available": True, "label": launcher["label"]}
 
 
+def _resolve_config(name: str) -> str:
+    """Expand a named config into a path the child can actually open.
+
+    get_configs() lists names with the extension stripped, and the child runs with
+    cwd set to the home directory, so a bare name does not resolve to anything from
+    there. Anything that already looks like a path is passed through untouched.
+    """
+    if not name or os.path.isabs(name) or os.path.sep in name:
+        return name
+    directory = _user_config_dir()
+    for candidate in (f"{name}.conf", name):
+        path = os.path.join(directory, candidate)
+        if os.path.isfile(path):
+            return path
+    return name
+
+
 def _build_argv(settings: dict):
     launcher = _launcher_for(settings["role"])
     if launcher is None:
@@ -202,7 +219,7 @@ def _build_argv(settings: dict):
     if settings["server"]:
         argv += ["--address", settings["server"]]
     if settings["config"]:
-        argv += ["--config", settings["config"]]
+        argv += ["--config", _resolve_config(settings["config"])]
     if launcher["headless"]:
         # Stay in the foreground so the plugin owns the process directly.
         argv.append("--no-daemon")
@@ -252,12 +269,22 @@ def _iter_deskflow_processes():
     """Yield (pid, cmdline) for running Deskflow processes owned by this user."""
     own_pid = os.getpid()
     own_pgid = os.getpgrp()
+    own_uid = os.getuid()
     protected = _protected_pids()
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
             continue
         pid = int(entry)
         if pid == own_pid or pid in protected:
+            continue
+        # /proc lists every process on the machine. A Deskflow owned by another
+        # user (a system-wide instance, or root) is neither ours to report on nor
+        # ours to signal, and including it would make the panel claim Deskflow is
+        # running while this plugin has nothing it can start or stop.
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != own_uid:
+                continue
+        except OSError:
             continue
         argv = _read_cmdline(pid)
         if not _is_deskflow_process(argv):
@@ -273,14 +300,12 @@ def _iter_deskflow_processes():
 
 
 def _parent_pid(pid: int) -> int:
-    try:
-        with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as handle:
-            stat = handle.read()
-    except (OSError, ValueError):
+    fields = _proc_stat_fields(pid)
+    if len(fields) < 2:
         return 0
     try:
-        return int(stat[stat.rindex(")") + 1:].split()[1])
-    except (ValueError, IndexError):
+        return int(fields[1])
+    except ValueError:
         return 0
 
 
@@ -306,6 +331,53 @@ def _protected_pids() -> set:
     return protected
 
 
+def _proc_stat_fields(pid: int) -> list:
+    """The fields of /proc/<pid>/stat that follow the (comm) field.
+
+    comm can contain spaces and parentheses, so the fields after it are located
+    from the last ")" rather than by splitting the whole line.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="replace") as handle:
+            stat = handle.read()
+    except (OSError, ValueError):
+        return []
+    try:
+        return stat[stat.rindex(")") + 1:].split()
+    except ValueError:
+        return []
+
+
+def _proc_state(pid: int) -> str:
+    fields = _proc_stat_fields(pid)
+    return fields[0] if fields else ""
+
+
+def _proc_starttime(pid: int) -> int:
+    """Kernel start time of a pid, in clock ticks since boot.
+
+    A pid on its own is not a stable handle: the kernel recycles pids, so a pid
+    read back from a state file can belong to an unrelated process by the time it
+    is used. Paired with the pid this identifies one specific process.
+    """
+    fields = _proc_stat_fields(pid)
+    # stat field 22 overall, which is index 19 once comm is stripped.
+    if len(fields) < 20:
+        return 0
+    try:
+        return int(fields[19])
+    except ValueError:
+        return 0
+
+
+def _reap(pid: int) -> None:
+    """Clear a finished child of ours so it does not linger as a zombie."""
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except (ChildProcessError, OSError):
+        pass
+
+
 def _alive(pid) -> bool:
     if not isinstance(pid, int) or pid <= 0:
         return False
@@ -315,13 +387,50 @@ def _alive(pid) -> bool:
         return False
     except PermissionError:
         return True
+    # A zombie still answers signal 0, but it has already exited: treating it as
+    # alive makes every stop wait out the full grace period and then report the
+    # process as unkillable.
+    if _proc_state(pid) == "Z":
+        _reap(pid)
+        return False
     return True
+
+
+def _recorded_pid(state: dict):
+    """The pid from a state file, but only if it is still the process we started.
+
+    Returns None when the recorded pid is gone, protected, or no longer the same
+    process, so a recycled pid is never mistaken for the plugin's child.
+    """
+    pid = state.get("pid")
+    if not isinstance(pid, int) or pid <= 1:
+        return None
+    if not _alive(pid):
+        return None
+    expected_start = state.get("starttime")
+    if isinstance(expected_start, int) and expected_start > 0:
+        if _proc_starttime(pid) != expected_start:
+            decky.logger.warning(
+                "Recorded pid %s now belongs to a different process, ignoring it", pid
+            )
+            return None
+        return pid
+    # State written before starttimes were recorded: fall back to checking that
+    # the pid still looks like Deskflow at all.
+    if not _is_deskflow_process(_read_cmdline(pid)):
+        decky.logger.warning("Recorded pid %s is not a Deskflow process, ignoring it", pid)
+        return None
+    return pid
 
 
 class Plugin:
     def __init__(self):
         self._boot_task = None
         self._last_error = None
+        # Held so the child can be waited on. Dropping the Popen leaves the
+        # exited process unreaped, and an unreaped child answers signal 0, which
+        # made every stop wait out the full grace period for a zombie.
+        self._child = None
 
     # ------------------------------------------------------------------ settings
     def get_settings(self) -> dict:
@@ -335,6 +444,7 @@ class Plugin:
         settings = _normalise(settings)
         try:
             _write_json(_settings_path(), settings)
+            self._last_error = None
         except OSError as err:
             decky.logger.error("Could not persist settings: %s", err)
             self._last_error = f"Could not save settings: {err}"
@@ -356,9 +466,16 @@ class Plugin:
     def get_status(self) -> dict:
         settings = self.get_settings()
         processes = list(_iter_deskflow_processes())
+        pids = [pid for pid, _ in processes]
+        # Distinguishes "Deskflow is running because this plugin started it" from
+        # "something else on the system is running Deskflow". Only the former can
+        # be stopped from the panel, so the panel has to be able to tell them
+        # apart rather than offering a Stop button that does nothing.
+        recorded = _recorded_pid(_read_json(_state_path()))
         return {
             "running": bool(processes),
-            "pids": [pid for pid, _ in processes],
+            "managed": recorded is not None and recorded in pids,
+            "pids": pids,
             "processes": [cmdline for _, cmdline in processes],
             "role": settings["role"],
             "autostart": settings["autostart"],
@@ -375,7 +492,10 @@ class Plugin:
         return await asyncio.to_thread(self._start)
 
     async def stop_deskflow(self) -> dict:
-        return await asyncio.to_thread(self._stop, True)
+        # Only Deskflow this plugin started is stopped. Sweeping every Deskflow
+        # process on the machine would take down an instance the user launched
+        # from Steam, which is exactly what this plugin promises not to do.
+        return await asyncio.to_thread(self._stop)
 
     async def restart_deskflow(self) -> dict:
         return await asyncio.to_thread(self._restart)
@@ -389,8 +509,15 @@ class Plugin:
             decky.logger.error("%s", err)
             return {"started": False, "error": str(err)}
 
-        if self.get_status()["running"]:
-            self._last_error = "Deskflow is already running."
+        status = self.get_status()
+        if status["running"]:
+            if not status["managed"]:
+                self._last_error = (
+                    "Another Deskflow is already running, started outside this "
+                    "plugin. Stop it first; this plugin will not terminate it."
+                )
+            else:
+                self._last_error = "Deskflow is already running."
             return {"started": False, "error": self._last_error}
 
         log_path = _child_log_path()
@@ -413,42 +540,67 @@ class Plugin:
             decky.logger.error("%s", err)
             return {"started": False, "error": self._last_error}
 
-        _write_json(
-            _state_path(),
-            {
-                "pid": process.pid,
-                "argv": argv,
-                "label": launcher["label"],
-                "started_at": time.time(),
-            },
-        )
+        self._child = process
+        try:
+            _write_json(
+                _state_path(),
+                {
+                    "pid": process.pid,
+                    "starttime": _proc_starttime(process.pid),
+                    "argv": argv,
+                    "label": launcher["label"],
+                    "started_at": time.time(),
+                },
+            )
+        except OSError as err:
+            # Without a state file the plugin has no handle on this process, so it
+            # could never stop it again. Take it back down rather than leak it.
+            decky.logger.error("Could not record Deskflow state: %s", err)
+            _terminate(process.pid, allow_group=True)
+            self._child = None
+            self._last_error = f"Could not start Deskflow: {err}"
+            return {"started": False, "error": self._last_error}
+
         self._last_error = None
         decky.logger.info("Deskflow started with pid %s", process.pid)
         for _ in range(12):
             time.sleep(0.25)
             if process.poll() is not None:
+                self._child = None
                 self._last_error = _tail(log_path)
                 decky.logger.error("Deskflow exited immediately with code %s", process.returncode)
                 return {"started": False, "error": self._last_error or "Deskflow exited immediately."}
         return {"started": True, "pid": process.pid, "label": launcher["label"]}
 
-    def _stop(self, include_foreign: bool = False) -> dict:
+    def _stop(self) -> dict:
+        # Only ever the process this plugin started. A Deskflow the user launched
+        # themselves is deliberately left alone, which is why there is no sweep
+        # over other Deskflow processes here.
         state = _read_json(_state_path())
-        pid = state.get("pid")
         stopped = []
+        failed = []
+        pid = _recorded_pid(state)
 
-        if _alive(pid):
+        if pid is not None:
             # Spawned by us, so its process group is ours to clean up.
-            stopped.append(pid)
-            _terminate(pid, allow_group=True)
+            if _terminate(pid, allow_group=True):
+                stopped.append(pid)
+            else:
+                failed.append(pid)
 
-        if include_foreign:
-            for other, _ in list(_iter_deskflow_processes()):
-                if other in stopped:
-                    continue
-                # Not started by this plugin: signal the pid only, never its group.
-                stopped.append(other)
-                _terminate(other, allow_group=False)
+        if self._child is not None:
+            try:
+                self._child.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+            self._child = None
+
+        if failed:
+            # The state file is kept: it is still the only handle on that process,
+            # so a later Stop can retry instead of the handle being lost.
+            decky.logger.info("Stopped Deskflow processes: %s", stopped or "none")
+            self._last_error = f"Could not stop Deskflow pid(s): {', '.join(map(str, failed))}"
+            return {"stopped": False, "pids": stopped, "failed": failed, "error": self._last_error}
 
         try:
             os.remove(_state_path())
@@ -460,7 +612,7 @@ class Plugin:
         return {"stopped": True, "pids": stopped}
 
     def _restart(self) -> dict:
-        self._stop(include_foreign=True)
+        self._stop()
         return self._start()
 
     # ------------------------------------------------------------ plugin lifecycle
@@ -487,16 +639,21 @@ class Plugin:
     async def _unload(self):
         if self._boot_task:
             self._boot_task.cancel()
+            try:
+                # Awaited so the cancellation is delivered before the loop closes;
+                # a task abandoned mid-sleep is reported as destroyed-pending.
+                await self._boot_task
+            except asyncio.CancelledError:
+                pass
             self._boot_task = None
-        state = _read_json(_state_path())
-        if _alive(state.get("pid")):
+        if _recorded_pid(_read_json(_state_path())) is not None:
             decky.logger.info("Unloading, stopping Deskflow started by this plugin")
             # Only our own process: a Deskflow the user started themselves is
             # left running.
-            await asyncio.to_thread(self._stop, False)
+            await asyncio.to_thread(self._stop)
 
     async def _uninstall(self):
-        await asyncio.to_thread(self._stop, False)
+        await asyncio.to_thread(self._stop)
         for path in (_state_path(), _child_log_path()):
             try:
                 os.remove(path)
@@ -515,7 +672,7 @@ def _send_signal(pid: int, sig: int, group: bool) -> bool:
     return True
 
 
-def _terminate(pid: int, allow_group: bool = False) -> None:
+def _terminate(pid: int, allow_group: bool = False) -> bool:
     """Signal one process, escalating from SIGTERM to SIGKILL.
 
     ``allow_group`` must only be True for a process this plugin spawned with
@@ -523,10 +680,13 @@ def _terminate(pid: int, allow_group: bool = False) -> None:
     whatever launched it -- a Deskflow GUI started from Steam shares Steam's group
     -- so signalling that group would terminate Steam itself and drop the user
     back to the login screen. Everything else gets a single-pid signal.
+
+    Returns True only when the process is gone by the end, so callers never
+    report a process as stopped when the signal was refused or ignored.
     """
     if not isinstance(pid, int) or pid <= 1 or pid in _protected_pids():
         decky.logger.warning("Refusing to signal protected pid %s", pid)
-        return
+        return False
 
     group = False
     if allow_group:
@@ -540,13 +700,17 @@ def _terminate(pid: int, allow_group: bool = False) -> None:
 
     for sig, wait in ((signal.SIGTERM, STOP_GRACE_PERIOD), (signal.SIGKILL, 1)):
         if not _send_signal(pid, sig, group):
-            return
+            return not _alive(pid)
         deadline = time.time() + wait
         while time.time() < deadline:
             if not _alive(pid):
-                return
+                return True
             time.sleep(0.2)
+        _reap(pid)
+        if not _alive(pid):
+            return True
     decky.logger.warning("Deskflow pid %s did not exit", pid)
+    return False
 
 
 def _tail(path: str, lines: int = 4) -> str:

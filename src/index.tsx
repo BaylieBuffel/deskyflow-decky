@@ -29,6 +29,7 @@ interface Launcher {
 
 interface Status {
   running: boolean;
+  managed: boolean;
   pids: number[];
   processes: string[];
   role: Role;
@@ -65,6 +66,15 @@ function Content() {
   const [configs, setConfigs] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const mounted = useRef(true);
+  // The current settings, readable from callbacks that must not close over a
+  // stale render. Two saves in the same tick (toggling autostart, then changing
+  // mode) would otherwise each send the pre-tick object and revert the first.
+  const settingsRef = useRef<Settings>(DEFAULTS);
+
+  const applySettings = useCallback((next: Settings) => {
+    settingsRef.current = next;
+    if (mounted.current) setLocalSettings(next);
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
@@ -81,7 +91,7 @@ function Content() {
     mounted.current = true;
     getSettings()
       .then((loaded) => {
-        if (mounted.current) setLocalSettings({ ...DEFAULTS, ...loaded });
+        if (mounted.current) applySettings({ ...DEFAULTS, ...loaded });
       })
       .catch((err) => console.error("Deskflow settings load failed", err));
     refresh();
@@ -90,27 +100,37 @@ function Content() {
       mounted.current = false;
       clearInterval(timer);
     };
-  }, [refresh]);
+  }, [refresh, applySettings]);
 
   const save = useCallback(
     async (patch: Partial<Settings>) => {
-      const next = { ...settings, ...patch };
-      setLocalSettings(next);
+      const next = { ...settingsRef.current, ...patch };
+      applySettings(next);
       try {
         const saved = await setSettings(next);
-        if (mounted.current) setLocalSettings({ ...DEFAULTS, ...saved });
+        if (mounted.current) applySettings({ ...DEFAULTS, ...saved });
       } catch (err) {
         console.error("Deskflow settings save failed", err);
         toaster.toast({ title: "Deskflow", body: `Could not save settings: ${err}` });
       }
     },
-    [settings]
+    [applySettings]
   );
 
   const run = useCallback(
     async (action: () => Promise<unknown>) => {
       setBusy(true);
       try {
+        // Flush any edit still sitting in local state (the text fields only save
+        // on blur) so a start triggered straight after typing does not launch
+        // with the settings that were on disk a moment earlier. A failed flush is
+        // not allowed to block the action: Stop must always be available.
+        try {
+          const saved = await setSettings(settingsRef.current);
+          if (mounted.current) applySettings({ ...DEFAULTS, ...saved });
+        } catch (err) {
+          console.error("Deskflow settings flush failed", err);
+        }
         const result = (await action()) as { error?: string } | undefined;
         if (result?.error) {
           toaster.toast({ title: "Deskflow", body: result.error });
@@ -123,10 +143,19 @@ function Content() {
         await refresh();
       }
     },
-    [refresh]
+    [refresh, applySettings]
   );
 
   const launcher = status?.launchers[settings.role];
+  const running = status?.running ?? false;
+  const managed = status?.managed ?? false;
+  const statusLabel = !status
+    ? "Checking..."
+    : running
+      ? managed
+        ? `Running (${status.pids.length} proc)`
+        : "Running (started outside this plugin)"
+      : "Stopped";
   const configOptions = [
     { label: "Default / none", data: "" },
     ...configs.map((name) => ({ label: name, data: name }))
@@ -138,8 +167,8 @@ function Content() {
         <PanelSectionRow>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
             <span>Status</span>
-            <span style={{ color: status?.running ? "#59bf40" : "var(--decky-text-secondary)" }}>
-              {status?.running ? `Running (${status.pids.length} proc)` : "Stopped"}
+            <span style={{ color: running ? "#59bf40" : "var(--decky-text-secondary)" }}>
+              {statusLabel}
             </span>
           </div>
         </PanelSectionRow>
@@ -155,21 +184,21 @@ function Content() {
           <div style={{ display: "flex", gap: "8px", width: "100%" }}>
             <ButtonItem
               layout="below"
-              disabled={busy || !status?.running}
+              disabled={busy || !managed}
               onClick={() => run(stopDeskflow)}
             >
               <FaStop /> Stop
             </ButtonItem>
             <ButtonItem
               layout="below"
-              disabled={busy || !status?.running}
+              disabled={busy || !managed}
               onClick={() => run(restartDeskflow)}
             >
               <FaSyncAlt /> Restart
             </ButtonItem>
             <ButtonItem
               layout="below"
-              disabled={busy || status?.running}
+              disabled={busy || running}
               onClick={() => run(startDeskflow)}
             >
               <FaPlay /> Start
@@ -243,9 +272,11 @@ function Content() {
         </PanelSectionRow>
         <PanelSectionRow>
           <div style={{ fontSize: "12px", color: "var(--decky-text-secondary)", whiteSpace: "normal" }}>
-            {launcher?.available
-              ? `Launch method: ${launcher.label}`
-              : "Deskflow not detected. Install it via apt or as a Flatpak, then refresh."}
+            {!status
+              ? "Checking for Deskflow..."
+              : launcher?.available
+                ? `Launch method: ${launcher.label}`
+                : "Deskflow not detected. Install it via apt or as a Flatpak, then refresh."}
           </div>
         </PanelSectionRow>
         <PanelSectionRow>

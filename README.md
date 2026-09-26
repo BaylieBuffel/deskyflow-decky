@@ -37,7 +37,7 @@ A Flatpak is only considered if no binary is present, and is launched with
 | `autostart`    | `true`   | Launch Deskflow when Steam starts.                                        |
 | `role`         | `client` | `client` connects out; `server` listens for clients.                     |
 | `server`       | `""`     | Client: the host/IP of the server. Server: local interface to listen on. |
-| `config`       | `""`     | Named config from `~/.config/deskflow/*.conf`, extension stripped.        |
+| `config`       | `""`     | Named config from `~/.config/deskflow/*.conf`, extension stripped. A bare name is resolved to its full path before launch, so it works regardless of the working directory. |
 | `extra_args`   | `""`     | Appended to the command line, e.g. `--debug INFO --enable-crypto`.        |
 
 Stored in `settings.json` under the plugin's settings directory. The launched process writes to
@@ -61,14 +61,21 @@ The plugin is deliberately conservative about process management, because a wron
 Steam Deck can end the session:
 
 - Processes are identified by **executable name**, never by matching "deskflow" anywhere in a
-  command line — otherwise the plugin's own paths and shortcuts would match.
+  command line — otherwise the plugin's own paths and shortcuts would match. Only processes
+  owned by the same user are considered at all, so a system-wide or root-owned Deskflow is
+  never reported or signalled.
 - A process is only ever signalled with a **single-pid** signal, never a process-group signal,
   unless the plugin itself spawned it with `start_new_session=True` and has confirmed it is a
   group leader. A GUI app started from Steam is *not* a group leader; killing its group would
   kill Steam itself.
 - Its own pid, pid 1, its process group and its entire ancestor chain are never signalled.
-- `Stop`/unload/uninstall only terminate Deskflow that this plugin started. A Deskflow you
-  launched yourself is left running.
+- The pid in the state file is paired with the kernel start time of the process it was written
+  for, so a pid that has since been recycled onto an unrelated process is recognised and left
+  alone.
+- `Stop`/Restart/unload/uninstall only terminate Deskflow that this plugin started. A Deskflow
+  you launched yourself is left running, and the panel says so — see below.
+- `Stop` reports failure rather than success when a process could not be signalled, so a refused
+  signal is never shown as a clean stop.
 
 ## Troubleshooting
 
@@ -77,6 +84,13 @@ detected launch method once found.
 
 **Status says Stopped but Deskflow is running** — a process sharing the plugin's own process
 group is deliberately ignored, to avoid signalling the session. Restart Steam and check again.
+
+**Status says "Running (started outside this plugin)"** — a Deskflow is running that this plugin
+did not start, so *Stop* is disabled and *Start* refuses: two instances would fight over the
+same port and config. Stop that instance yourself, then press *Start*. This is the plugin
+declining to kill a process it does not own, not a failure.
+
+**Start does nothing and the panel says Deskflow is already running** — see the entry above.
 
 **It starts and immediately exits** — the plugin captures the last few log lines and shows them
 in the panel. Check `deskflow.log` in the plugin's runtime directory for the full output. Common
