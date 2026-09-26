@@ -1,115 +1,269 @@
 import {
   ButtonItem,
+  DropdownItem,
+  Field,
   PanelSection,
   PanelSectionRow,
-  Navigation,
-  staticClasses
+  staticClasses,
+  TextField,
+  ToggleField
 } from "@decky/ui";
-import {
-  addEventListener,
-  removeEventListener,
-  callable,
-  definePlugin,
-  toaster,
-  // routerHook
-} from "@decky/api"
-import { useState } from "react";
-import { FaShip } from "react-icons/fa";
+import { callable, definePlugin, toaster } from "@decky/api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { FaPlay, FaProjectDiagram, FaStop, FaSyncAlt } from "react-icons/fa";
 
-// import logo from "../assets/logo.png";
+type Role = "client" | "server";
 
-// This function calls the python function "add", which takes in two numbers and returns their sum (as a number)
-// Note the type annotations:
-//  the first one: [first: number, second: number] is for the arguments
-//  the second one: number is for the return value
-const add = callable<[first: number, second: number], number>("add");
+interface Settings {
+  autostart: boolean;
+  role: Role;
+  server: string;
+  config: string;
+  extra_args: string;
+}
 
-// This function calls the python function "start_timer", which takes in no arguments and returns nothing.
-// It starts a (python) timer which eventually emits the event 'timer_event'
-const startTimer = callable<[], void>("start_timer");
+interface Launcher {
+  available: boolean;
+  label: string | null;
+}
 
-function Content() {
-  const [result, setResult] = useState<number | undefined>();
+interface Status {
+  running: boolean;
+  pids: number[];
+  processes: string[];
+  role: Role;
+  autostart: boolean;
+  launchers: { client: Launcher; server: Launcher };
+  config_dir: string;
+  last_error: string | null;
+}
 
-  const onClick = async () => {
-    const result = await add(Math.random(), Math.random());
-    setResult(result);
-  };
-
-  return (
-    <PanelSection title="Panel Section">
-      <PanelSectionRow>
-        <ButtonItem
-          layout="below"
-          onClick={onClick}
-        >
-          {result ?? "Add two numbers via Python"}
-        </ButtonItem>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <ButtonItem
-          layout="below"
-          onClick={() => startTimer()}
-        >
-          {"Start Python timer"}
-        </ButtonItem>
-      </PanelSectionRow>
-
-      {/* <PanelSectionRow>
-        <div style={{ display: "flex", justifyContent: "center" }}>
-          <img src={logo} />
-        </div>
-      </PanelSectionRow> */}
-
-      {/*<PanelSectionRow>
-        <ButtonItem
-          layout="below"
-          onClick={() => {
-            Navigation.Navigate("/decky-plugin-test");
-            Navigation.CloseSideMenus();
-          }}
-        >
-          Router
-        </ButtonItem>
-      </PanelSectionRow>*/}
-    </PanelSection>
-  );
+const DEFAULTS: Settings = {
+  autostart: true,
+  role: "client",
+  server: "",
+  config: "",
+  extra_args: ""
 };
 
-export default definePlugin(() => {
-  console.log("Template plugin initializing, this is called once on frontend startup")
+const getSettings = callable<[], Settings>("get_settings");
+const setSettings = callable<[Settings], Settings>("set_settings");
+const getStatus = callable<[], Status>("get_status");
+const getConfigs = callable<[], string[]>("get_configs");
+const startDeskflow = callable<[], { started: boolean; error?: string }>("start_deskflow");
+const stopDeskflow = callable<[], { stopped: boolean }>("stop_deskflow");
+const restartDeskflow = callable<[], { started: boolean; error?: string }>("restart_deskflow");
 
-  // serverApi.routerHook.addRoute("/decky-plugin-test", DeckyPluginRouterTest, {
-  //   exact: true,
-  // });
+const ROLE_OPTIONS = [
+  { label: "Client - this Deck connects out", data: "client" },
+  { label: "Server - this Deck accepts clients", data: "server" }
+];
 
-  // Add an event listener to the "timer_event" event from the backend
-  const listener = addEventListener<[
-    test1: string,
-    test2: boolean,
-    test3: number
-  ]>("timer_event", (test1, test2, test3) => {
-    console.log("Template got timer_event with:", test1, test2, test3)
-    toaster.toast({
-      title: "template got timer_event",
-      body: `${test1}, ${test2}, ${test3}`
-    });
-  });
+function Content() {
+  const [settings, setLocalSettings] = useState<Settings>(DEFAULTS);
+  const [status, setStatus] = useState<Status | null>(null);
+  const [configs, setConfigs] = useState<string[]>([]);
+  const [busy, setBusy] = useState(false);
+  const mounted = useRef(true);
 
-  return {
-    // The name shown in various decky menus
-    name: "Test Plugin",
-    // The element displayed at the top of your plugin's menu
-    titleView: <div className={staticClasses.Title}>Decky Example Plugin</div>,
-    // The content of your plugin's menu
-    content: <Content />,
-    // The icon displayed in the plugin list
-    icon: <FaShip />,
-    // The function triggered when your plugin unloads
-    onDismount() {
-      console.log("Unloading")
-      removeEventListener("timer_event", listener);
-      // serverApi.routerHook.removeRoute("/decky-plugin-test");
+  const refresh = useCallback(async () => {
+    try {
+      const [nextStatus, nextConfigs] = await Promise.all([getStatus(), getConfigs()]);
+      if (!mounted.current) return;
+      setStatus(nextStatus);
+      setConfigs(nextConfigs);
+    } catch (err) {
+      console.error("Deskflow status refresh failed", err);
+    }
+  }, []);
+
+  useEffect(() => {
+    mounted.current = true;
+    getSettings()
+      .then((loaded) => {
+        if (mounted.current) setLocalSettings({ ...DEFAULTS, ...loaded });
+      })
+      .catch((err) => console.error("Deskflow settings load failed", err));
+    refresh();
+    const timer = setInterval(refresh, 5000);
+    return () => {
+      mounted.current = false;
+      clearInterval(timer);
+    };
+  }, [refresh]);
+
+  const save = useCallback(
+    async (patch: Partial<Settings>) => {
+      const next = { ...settings, ...patch };
+      setLocalSettings(next);
+      try {
+        const saved = await setSettings(next);
+        if (mounted.current) setLocalSettings({ ...DEFAULTS, ...saved });
+      } catch (err) {
+        console.error("Deskflow settings save failed", err);
+        toaster.toast({ title: "Deskflow", body: `Could not save settings: ${err}` });
+      }
     },
-  };
-});
+    [settings]
+  );
+
+  const run = useCallback(
+    async (action: () => Promise<unknown>) => {
+      setBusy(true);
+      try {
+        const result = (await action()) as { error?: string } | undefined;
+        if (result?.error) {
+          toaster.toast({ title: "Deskflow", body: result.error });
+        }
+      } catch (err) {
+        console.error("Deskflow action failed", err);
+        toaster.toast({ title: "Deskflow", body: String(err) });
+      } finally {
+        setBusy(false);
+        await refresh();
+      }
+    },
+    [refresh]
+  );
+
+  const launcher = status?.launchers[settings.role];
+  const configOptions = [
+    { label: "Default / none", data: "" },
+    ...configs.map((name) => ({ label: name, data: name }))
+  ];
+
+  return (
+    <>
+      <PanelSection title="Deskflow">
+        <PanelSectionRow>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <span>Status</span>
+            <span style={{ color: status?.running ? "#59bf40" : "var(--decky-text-secondary)" }}>
+              {status?.running ? `Running (${status.pids.length} proc)` : "Stopped"}
+            </span>
+          </div>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ToggleField
+            label="Start on boot"
+            description="Launch Deskflow automatically when Steam starts"
+            checked={settings.autostart}
+            onChange={(autostart) => save({ autostart })}
+          />
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <div style={{ display: "flex", gap: "8px", width: "100%" }}>
+            <ButtonItem
+              layout="below"
+              disabled={busy || !status?.running}
+              onClick={() => run(stopDeskflow)}
+            >
+              <FaStop /> Stop
+            </ButtonItem>
+            <ButtonItem
+              layout="below"
+              disabled={busy || !status?.running}
+              onClick={() => run(restartDeskflow)}
+            >
+              <FaSyncAlt /> Restart
+            </ButtonItem>
+            <ButtonItem
+              layout="below"
+              disabled={busy || status?.running}
+              onClick={() => run(startDeskflow)}
+            >
+              <FaPlay /> Start
+            </ButtonItem>
+          </div>
+        </PanelSectionRow>
+        {status?.last_error && (
+          <PanelSectionRow>
+            <div style={{ color: "#f2545b", fontSize: "12px", whiteSpace: "normal" }}>
+              {status.last_error}
+            </div>
+          </PanelSectionRow>
+        )}
+      </PanelSection>
+
+      <PanelSection title="Connection">
+        <PanelSectionRow>
+          <Field
+            label="Mode"
+            description="Client connects to another machine, Server waits for clients to connect"
+          >
+            <DropdownItem
+              rgOptions={ROLE_OPTIONS}
+              selectedOption={settings.role}
+              onChange={(item) => save({ role: item.data as Role })}
+            />
+          </Field>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <Field
+            label="Server address"
+            description={
+              settings.role === "client"
+                ? "Host or IP of the machine running the Deskflow server, e.g. 192.168.1.10"
+                : "Optional interface to listen on, e.g. 192.168.1.20:24800"
+            }
+          >
+            <TextField
+              value={settings.server}
+              onChange={(event) => setLocalSettings({ ...settings, server: event.target.value })}
+              onBlur={() => save({})}
+            />
+          </Field>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <Field
+            label="Named config"
+            description={`Configs found in ${status?.config_dir ?? "~/.config/deskflow"}`}
+          >
+            <DropdownItem
+              rgOptions={configOptions}
+              selectedOption={settings.config}
+              onChange={(item) => save({ config: String(item.data) })}
+            />
+          </Field>
+        </PanelSectionRow>
+      </PanelSection>
+
+      <PanelSection title="Advanced">
+        <PanelSectionRow>
+          <Field
+            label="Extra arguments"
+            description="Appended to the launch command, e.g. --debug INFO --enable-crypto"
+          >
+            <TextField
+              value={settings.extra_args}
+              onChange={(event) => setLocalSettings({ ...settings, extra_args: event.target.value })}
+              onBlur={() => save({})}
+            />
+          </Field>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <div style={{ fontSize: "12px", color: "var(--decky-text-secondary)", whiteSpace: "normal" }}>
+            {launcher?.available
+              ? `Launch method: ${launcher.label}`
+              : "Deskflow not detected. Install it via apt or as a Flatpak, then refresh."}
+          </div>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={() => refresh()}>
+            Refresh status
+          </ButtonItem>
+        </PanelSectionRow>
+      </PanelSection>
+    </>
+  );
+}
+
+export default definePlugin(() => ({
+  name: "Deskflow Autostart",
+  titleView: <div className={staticClasses.Title}>Deskflow</div>,
+  content: <Content />,
+  icon: <FaProjectDiagram />,
+  onDismount() {
+    console.log("Deskflow Autostart unloaded");
+  }
+}));
